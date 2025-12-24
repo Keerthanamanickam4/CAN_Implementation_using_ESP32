@@ -1,0 +1,104 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/twai.h"
+#include "driver/gpio.h"
+#include "esp_timer.h"
+#include "esp_err.h"
+#include "esp_rom_sys.h"
+
+// ===== Ultrasonic Pins =====
+#define TRIG_PIN GPIO_NUM_18
+#define ECHO_PIN GPIO_NUM_19
+
+// ===== Measure Distance with Range Filter =====
+float measure_distance_cm() {
+    gpio_set_level(TRIG_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    gpio_set_level(TRIG_PIN, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(TRIG_PIN, 0);
+
+    int64_t start = esp_timer_get_time();
+    while (gpio_get_level(ECHO_PIN) == 0) {
+        if (esp_timer_get_time() - start > 100000) return -1; // Timeout 100 ms
+    }
+    int64_t echo_start = esp_timer_get_time();
+
+    while (gpio_get_level(ECHO_PIN) == 1) {
+        if (esp_timer_get_time() - echo_start > 200000) return -1; // Timeout 200 ms
+    }
+    int64_t echo_end = esp_timer_get_time();
+
+    float distance = (echo_end - echo_start) / 58.0;
+
+    // Reject noise and invalid readings
+    if (distance < 2.0 || distance > 400.0) {
+        return -1;
+    }
+
+    return distance;
+}
+
+// ===== Main Function =====
+void app_main(void) {
+    printf("ESP32 CAN Transmit + Ultrasonic\n");
+
+    // Setup ultrasonic pins
+    gpio_set_direction(TRIG_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ECHO_PIN, GPIO_MODE_INPUT);
+
+    // ===== CAN Setup =====
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        GPIO_NUM_21,  // CAN TX
+        GPIO_NUM_22,  // CAN RX
+        TWAI_MODE_NORMAL
+    );
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    if (twai_driver_install(&g_config, &t_config, &f_config) != ESP_OK) {
+        printf("CAN install failed\n");
+        return;
+    }
+    if (twai_start() != ESP_OK) {
+        printf("CAN start failed\n");
+        return;
+    }
+    printf("CAN initialized\n");
+
+    // ===== Main Loop =====
+    while (1) {
+        float distance = measure_distance_cm();
+
+        if (distance < 0) {
+            printf("No object detected. Sending 0 cm.\n");
+            distance = 0;
+        } else {
+            printf("Measured Distance: %.2f cm\n", distance);
+        }
+
+        // Prepare CAN message
+        twai_message_t message = {
+            .identifier = 0x100,
+            .extd = 0,
+            .rtr = 0,
+            .data_length_code = 2,
+            .data = {
+                (uint8_t)distance,
+                (uint8_t)((int)(distance * 10) % 100)
+            }
+        };
+
+        // Transmit over CAN
+        esp_err_t err = twai_transmit(&message, pdMS_TO_TICKS(1000));
+        if (err == ESP_OK) {
+            printf("CAN Sent: %.2f cm | Data = %02X %02X\n",
+                   distance, message.data[0], message.data[1]);
+        } else {
+            printf("CAN TX Failed: %s\n", esp_err_to_name(err));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(2000)); // 2-second delay
+    }
+}
